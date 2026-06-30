@@ -9,6 +9,7 @@ import torch.nn as nn
 
 from vllm_omni.diffusion.model_loader.checkpoint_adapters import (
     ModelOptFp8CheckpointAdapter,
+    ModelOptNvFp4CheckpointAdapter,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
@@ -92,3 +93,18 @@ def test_modelopt_adapter_keeps_scale_tensors_for_quantized_target():
         "transformer.block.to_q.weight_scale",
         "transformer.block.to_q.input_scale",
     ]
+
+
+def test_modelopt_nvfp4_adapter_keeps_scales_for_downstream_remap():
+    adapter = ModelOptNvFp4CheckpointAdapter(nn.Module(), _make_source())
+    prefix = "transformer.layers.0.self_attn.add_q_proj"
+    checkpoint_tensors = [
+        (f"{prefix}.input_scale", torch.tensor([1.0])),
+        (f"{prefix}.weight_scale", torch.tensor([0.5])),
+        (f"{prefix}.weight_scale_2", torch.tensor([0.25])),
+        (f"{prefix}.weight", torch.tensor([[1]], dtype=torch.uint8)),
+    ]
+
+    adapted = list(adapter.adapt(iter(checkpoint_tensors)))
+
+    assert [name for name, _ in adapted] == [name for name, _ in checkpoint_tensors]

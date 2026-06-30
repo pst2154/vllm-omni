@@ -87,6 +87,13 @@ class ModelOptFp8CheckpointAdapter:
             return weight_name[: -len(".weight")] + ".weight_scale"
         return None
 
+    @staticmethod
+    def _get_scale_weight_name(scale_name: str) -> str | None:
+        for suffix in MODEL_OPT_SCALE_SUFFIXES:
+            if scale_name.endswith(suffix):
+                return scale_name[: -len(suffix)] + ".weight"
+        return None
+
     @classmethod
     def _get_weights_mapper(cls, model: nn.Module) -> WeightsMapper:
         mapping = {
@@ -172,9 +179,13 @@ class ModelOptFp8CheckpointAdapter:
         state: _AdaptState,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         state.scale_tensors[name] = tensor
-        if target_name is None:
+        weight_name = self._get_scale_weight_name(name)
+        weight_target_name = self._resolve_target_name(weight_name) if weight_name is not None else None
+        if target_name is None and weight_target_name is not None:
             state.skipped_scales += 1
         else:
+            # Model-specific loaders may remap checkpoint namespaces after
+            # adaptation, so preserve scales when the weight is unresolved too.
             yield name, tensor
         yield from self._flush_pending_weights(name, state)
 
