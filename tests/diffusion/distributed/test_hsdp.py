@@ -6,12 +6,52 @@ These tests verify HSDP configuration logic without requiring a distributed envi
 """
 
 import pytest
+import torch
 import torch.nn as nn
 
 from vllm_omni.diffusion.data import DiffusionParallelConfig
-from vllm_omni.diffusion.distributed.hsdp import HSDPInferenceConfig
+from vllm_omni.diffusion.distributed.hsdp import (
+    HSDPInferenceConfig,
+    _unshardable_parameters,
+    shard_model,
+)
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.parallel, pytest.mark.cpu, pytest.mark.core_model]
+
+
+class _PackedBlock(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(2, 2))
+        self.packed_weight = nn.Parameter(torch.ones(2, 2, dtype=torch.uint8), requires_grad=False)
+        self.input_global_scale = nn.Parameter(torch.tensor(1.0), requires_grad=False)
+
+
+class _PackedModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.block = _PackedBlock()
+        self.root_weight = nn.Parameter(torch.ones(2))
+
+
+def test_hsdp_ignores_packed_and_scalar_parameters_in_nested_wraps(mocker):
+    model = _PackedModel()
+    ignored_params = _unshardable_parameters(model)
+    expected_ignored = {model.block.packed_weight, model.block.input_global_scale}
+    assert ignored_params == expected_ignored
+
+    fully_shard = mocker.patch("vllm_omni.diffusion.distributed.hsdp.fully_shard")
+    shard_model(
+        model,
+        hsdp_shard_conditions=[lambda name, _module: name == "block"],
+        ignored_params=ignored_params,
+    )
+
+    assert fully_shard.call_count == 2
+    child_kwargs = fully_shard.call_args_list[0].kwargs
+    root_kwargs = fully_shard.call_args_list[1].kwargs
+    assert child_kwargs["ignored_params"] == expected_ignored
+    assert root_kwargs["ignored_params"] == expected_ignored
 
 
 class TestHSDPInferenceConfig:
