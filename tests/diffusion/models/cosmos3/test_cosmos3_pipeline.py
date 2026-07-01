@@ -821,6 +821,7 @@ def test_prompt_formatting_and_checkpoint_key_remap(make_cosmos3_pipeline) -> No
         ),
     }
     assert {key: Cosmos3OmniDiffusersPipeline._remap_ckpt_key(key) for key in remaps} == remaps
+    assert {key: Cosmos3OmniDiffusersPipeline.remap_checkpoint_key(key) for key in remaps} == remaps
 
 
 def test_prepare_latents_for_video_image_sound_and_action(make_cosmos3_pipeline) -> None:

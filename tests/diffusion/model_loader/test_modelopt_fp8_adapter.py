@@ -41,6 +41,48 @@ class _QuantizedPackedModelOptModel(nn.Module):
             "input_scale",
             nn.Parameter(torch.empty(1), requires_grad=False),
         )
+        self.transformer.block.to_qkv.register_parameter(
+            "pre_quant_scale",
+            nn.Parameter(torch.empty(1), requires_grad=False),
+        )
+
+
+class _RemappedModelOptModel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.runtime = nn.Module()
+        self.runtime.proj = nn.Linear(2, 2, bias=False)
+
+    @staticmethod
+    def remap_checkpoint_key(name: str) -> str:
+        return {"transformer.orig.proj.weight": "runtime.proj.weight"}.get(name, name)
+
+
+class _RemappedNvFp4Model(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.runtime = nn.Module()
+        self.runtime.proj = nn.Module()
+        self.runtime.proj.register_parameter(
+            "weight",
+            nn.Parameter(torch.empty(1, 1, dtype=torch.uint8), requires_grad=False),
+        )
+        for name in ("input_scale", "pre_quant_scale", "weight_scale", "weight_scale_2"):
+            self.runtime.proj.register_parameter(name, nn.Parameter(torch.empty(1), requires_grad=False))
+
+    @staticmethod
+    def remap_checkpoint_key(name: str) -> str:
+        return name.replace("transformer.orig.proj.", "runtime.proj.")
+
+
+class _FakeQuantConfig:
+    def __init__(self, name: str, **attrs: object) -> None:
+        self._name = name
+        for attr_name, value in attrs.items():
+            setattr(self, attr_name, value)
+
+    def get_name(self) -> str:
+        return self._name
 
 
 def _make_source() -> SimpleNamespace:
@@ -95,11 +137,45 @@ def test_modelopt_adapter_keeps_scale_tensors_for_quantized_target():
     ]
 
 
-def test_modelopt_nvfp4_adapter_keeps_scales_for_downstream_remap():
-    adapter = ModelOptNvFp4CheckpointAdapter(nn.Module(), _make_source())
-    prefix = "transformer.layers.0.self_attn.add_q_proj"
+def test_modelopt_adapter_keeps_awq_pre_quant_scale_for_quantized_target():
+    model = _QuantizedPackedModelOptModel()
+    adapter = ModelOptNvFp4CheckpointAdapter(model, _make_source())
+    scale = torch.tensor([0.25], dtype=torch.float32)
+
+    adapted = list(adapter.adapt(iter([("transformer.block.to_q.pre_quant_scale", scale)])))
+
+    assert [name for name, _ in adapted] == ["transformer.block.to_q.pre_quant_scale"]
+    assert torch.equal(adapted[0][1], scale)
+
+
+def test_modelopt_adapter_uses_checkpoint_key_remap_for_full_precision_target():
+    model = _RemappedModelOptModel()
+    adapter = ModelOptFp8CheckpointAdapter(model, _make_source())
+    fp8_weight = torch.tensor([[2.0, -4.0], [1.0, 3.0]], dtype=torch.float32).to(torch.float8_e4m3fn)
+    scale = torch.tensor([0.5], dtype=torch.float32)
+
+    adapted = list(
+        adapter.adapt(
+            iter(
+                [
+                    ("transformer.orig.proj.weight", fp8_weight),
+                    ("transformer.orig.proj.weight_scale", scale),
+                ]
+            )
+        )
+    )
+
+    assert [name for name, _ in adapted] == ["runtime.proj.weight"]
+    assert adapted[0][1].dtype == model.runtime.proj.weight.dtype
+    assert torch.allclose(adapted[0][1], fp8_weight.to(torch.float32) * scale)
+
+
+def test_modelopt_nvfp4_adapter_remaps_quantized_weights_and_scales():
+    adapter = ModelOptNvFp4CheckpointAdapter(_RemappedNvFp4Model(), _make_source())
+    prefix = "transformer.orig.proj"
     checkpoint_tensors = [
         (f"{prefix}.input_scale", torch.tensor([1.0])),
+        (f"{prefix}.pre_quant_scale", torch.tensor([0.75])),
         (f"{prefix}.weight_scale", torch.tensor([0.5])),
         (f"{prefix}.weight_scale_2", torch.tensor([0.25])),
         (f"{prefix}.weight", torch.tensor([[1]], dtype=torch.uint8)),
@@ -107,4 +183,16 @@ def test_modelopt_nvfp4_adapter_keeps_scales_for_downstream_remap():
 
     adapted = list(adapter.adapt(iter(checkpoint_tensors)))
 
-    assert [name for name, _ in adapted] == [name for name, _ in checkpoint_tensors]
+    assert [name for name, _ in adapted] == [name.replace(f"{prefix}.", "runtime.proj.") for name, _ in checkpoint_tensors]
+
+
+def test_modelopt_adapter_filters_unmapped_scales_without_model_hook():
+    adapter = ModelOptNvFp4CheckpointAdapter(nn.Module(), _make_source())
+
+    assert list(adapter.adapt(iter([("transformer.unknown.input_scale", torch.tensor([1.0]))]))) == []
+
+
+def test_modelopt_nvfp4_adapter_accepts_serialized_checkpoints():
+    quant_config = _FakeQuantConfig("modelopt_fp4", is_checkpoint_nvfp4_serialized=True)
+
+    assert ModelOptNvFp4CheckpointAdapter.is_compatible(_make_source(), quant_config, use_safetensors=True)
